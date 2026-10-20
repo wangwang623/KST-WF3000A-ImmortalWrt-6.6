@@ -1,0 +1,392 @@
+name: Build KST-WF3000A ImmortalWrt 6.6
+
+# ══════════════════════════════════════════════════════════════
+# 模式：源码仓库保持原样，所有移植改动由 prepare-source.py 在
+#       克隆之后、编译之前完成。
+#
+# 相对于原版只多了三处无线校验（6 / 8 / 12 步），目的是防止
+# 「编译成功但没 WiFi」——那正是之前的坑，且要几十分钟后刷机才发现。
+# 这三处都不改变编译行为，只在有问题时提前失败。
+# ══════════════════════════════════════════════════════════════
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: '源码引用（分支名或 commit sha）'
+        required: true
+        type: string
+        default: openwrt-24.10-6.6
+      publish_release:
+        description: Publish firmware as a GitHub Release
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: wf3000a-immortalwrt-6.6
+  cancel-in-progress: false
+
+env:
+  SOURCE_REPO: https://github.com/wangwang623/immortalwrt-mt798x-6.6.git
+  TZ: Asia/Shanghai
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+
+    steps:
+      # ── 1. 取出本构建仓库（含 DTS / device.mk / 脚本 / config）──
+      - name: Checkout build project
+        uses: actions/checkout@v5
+
+      # ── 2. 腾磁盘 ─────────────────────────────────────────
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo rm -rf /usr/local/share/powershell /usr/share/swift /usr/local/julia* \
+                     /usr/local/lib/node_modules /opt/az /opt/microsoft /usr/lib/mono
+          sudo docker image prune --all --force
+          sudo apt-get -qq clean
+          df -hT
+
+      # ── 3. 装编译依赖 ─────────────────────────────────────
+      - name: Install build dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo apt-get -qq update
+          sudo apt-get -qq install --no-install-recommends \
+            ack antlr3 asciidoc autoconf automake autopoint binutils bison \
+            build-essential bzip2 ccache clang cmake cpio curl device-tree-compiler \
+            ecj fastjar flex gawk gettext gcc-multilib g++-multilib git gnutls-dev \
+            gperf haveged help2man intltool lib32gcc-s1 libc6-dev-i386 libelf-dev \
+            libglib2.0-dev libgmp3-dev libltdl-dev libmpc-dev libmpfr-dev \
+            libncurses-dev libpython3-dev libreadline-dev libssl-dev libtool \
+            libyaml-dev libz-dev lld llvm lrzsz mkisofs msmtp nano ninja-build \
+            p7zip p7zip-full patch pkgconf python3 python3-pip python3-ply \
+            python3-docutils python3-pyelftools qemu-utils re2c rsync scons \
+            squashfs-tools subversion swig texinfo uglifyjs upx-ucl unzip vim \
+            wget xmlto xxd zlib1g-dev zstd
+          sudo timedatectl set-timezone "$TZ"
+
+      # ── 4. 克隆源码 ───────────────────────────────────────
+      - name: Fetch source from fork
+        run: |
+          mkdir -p "$RUNNER_TEMP/wf3000a-build"
+          git init -q "$RUNNER_TEMP/wf3000a-build/openwrt"
+          git -C "$RUNNER_TEMP/wf3000a-build/openwrt" remote add origin "$SOURCE_REPO"
+          git -C "$RUNNER_TEMP/wf3000a-build/openwrt" fetch --depth=1 origin "${{ inputs.source_ref }}"
+          git -C "$RUNNER_TEMP/wf3000a-build/openwrt" checkout --detach FETCH_HEAD
+          echo "OPENWRT=$RUNNER_TEMP/wf3000a-build/openwrt" >> "$GITHUB_ENV"
+          echo "fetched: $(git -C "$RUNNER_TEMP/wf3000a-build/openwrt" rev-parse HEAD)"
+
+      # ── 5. 打板级移植补丁 ─────────────────────────────────
+      - name: Apply WF3000A board port
+        run: |
+          python3 scripts/prepare-source.py "$OPENWRT"
+
+      # ── 6. ★ 无线校验 ①：驱动方案是否还在（defconfig 之前）──
+      #    这份源码没有开源 mt76，无线靠 package/mtk/drivers 下的闭源驱动。
+      #    先确认它在，免得编译几十分钟后才发现方案变了。
+      - name: Verify wireless driver present
+        working-directory: ${{ runner.temp }}/wf3000a-build/openwrt
+        run: |
+          for d in package/mtk/drivers/mt_wifi \
+                   package/mtk/drivers/warp \
+                   package/mtk/drivers/conninfra \
+                   package/mtk/drivers/wifi-profile \
+                   package/mtk/applications/mtwifi-cfg ; do
+            [ -d "$d" ] || {
+              echo "::error::缺少无线包目录 $d —— 这份源码的无线方案可能已变更" >&2
+              exit 1; }
+          done
+          echo "[OK] 5 个无线包目录齐全"
+
+          # MT7981 固件：驱动加载必需
+          ls package/mtk/drivers/mt_wifi/files/mt7981-fw-20240613/ || {
+            echo "::error::MT7981 固件目录缺失" >&2; exit 1; }
+
+          # 运行期把 EEPROM 偏移覆盖为 0x0 的 .dat（本机的 0x0 靠它）
+          grep -i '^INDEX0_EEPROM_offset' \
+            package/mtk/drivers/wifi-profile/files/mt7981/l1profile.dat || {
+            echo "::error::l1profile.dat 缺少 INDEX0_EEPROM_offset" >&2; exit 1; }
+
+          # 该 .dat 只有 first_card_name=MT7981 时才会被装上机
+          for sym in 'CONFIG_first_card=y' 'CONFIG_first_card_name="MT7981"'; do
+            grep -qxF "$sym" "$GITHUB_WORKSPACE/config/wf3000a.config" || {
+              echo "::error::config 缺少 $sym —— l1profile.dat 不会被安装" >&2
+              exit 1; }
+          done
+          echo "[OK] 固件 / l1profile / first_card_name 均在位"
+
+      # ── 6b. ★ 与上游 defconfig【双向】比对 ──────────────────
+      #    上次失败的根因就在这里：只比对了「我写了什么」，没比对
+      #    「上游禁用了什么」。MTK_PRE_CAL_TRX_SET1/SET2 默认 y，
+      #    上游显式关闭，我的 config 漏抄 → 被默认打开 →
+      #    eeprom.c 引用一批未定义符号 → mt_wifi 编译失败。
+      #    这里做双向比对，任何差异（含 is not set）都直接拦下。
+      - name: Cross-check MTK symbols against upstream defconfig
+        working-directory: ${{ runner.temp }}/wf3000a-build/openwrt
+        run: |
+          python3 - <<'PYEOF'
+          import re, sys
+          PAT = re.compile(r'CONFIG_(MTK_|CONNINFRA_|WARP_|WED_|first_card)')
+
+          NOTSET = re.compile(r'^# (CONFIG_\w+) is not set$')
+
+          def load(p):
+              """后出现的行覆盖先出现的（上游存在重复符号）。
+
+              ⚠️ 必须先判 '# CONFIG_X is not set'，再判 'CONFIG_X='。
+                 前者以 # 开头，若先被 startswith('CONFIG_') 过滤掉，
+                 所有「上游显式关闭」的项就都比对不到 —— 这正是上次
+                 漏掉 MTK_PRE_CAL_TRX_SET1/SET2、导致 mt_wifi 编译
+                 失败的原因。这个坑踩了两次，别再改回去。
+              """
+              d = {}
+              for line in open(p, encoding='utf-8'):
+                  line = line.strip()
+                  m = NOTSET.match(line)
+                  if m:
+                      d[m.group(1)] = '<not set>'
+                      continue
+                  if not line.startswith('CONFIG_') or '=' not in line:
+                      continue
+                  k, v = line.split('=', 1)
+                  d[k] = v
+              return {k: v for k, v in d.items() if PAT.match(k)}
+
+          up = load('defconfig/mt7981-ax3000.config')
+          my = load('${{ github.workspace }}/config/wf3000a.config')
+          if not up:
+              print("::error::上游 defconfig/mt7981-ax3000.config 缺失或为空")
+              sys.exit(1)
+
+          diffs = []
+          for k in sorted(set(up) | set(my)):
+              if up.get(k) != my.get(k):
+                  diffs.append((k, my.get(k, '<缺失>'), up.get(k, '<缺失>')))
+
+          print(f"上游驱动符号 {len(up)} 项，我的 {len(my)} 项")
+          if diffs:
+              print(f"::error::与上游 defconfig 存在 {len(diffs)} 处差异")
+              for k, a, b in diffs:
+                  print(f"  {k}: 我的={a}  上游={b}")
+              print("提示：上游用 '# CONFIG_X is not set' 显式关闭的项也必须抄过来，")
+              print("      否则 config.in 里的 default y 会把它们打开。")
+              sys.exit(1)
+          print(f"✓ 与上游 defconfig 双向一致（{len(up)} 项，含 is not set）")
+          PYEOF
+
+      # ── 7. 拉 feeds ───────────────────────────────────────
+      - name: Update and install feeds
+        working-directory: ${{ runner.temp }}/wf3000a-build/openwrt
+        run: |
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      # ── 8. ★ 无线校验 ②：配置是否被 defconfig 静默丢弃 ──────
+      - name: Load and validate configuration
+        working-directory: ${{ runner.temp }}/wf3000a-build/openwrt
+        run: |
+          cp "$GITHUB_WORKSPACE/config/wf3000a.config" .config
+          make defconfig
+
+          fail() {
+            echo "::error::make defconfig 后缺少必需项: $*" >&2
+            echo "── .config 中实际存在的无线相关行 ──" >&2
+            grep -E "^(CONFIG_MTK_|CONFIG_CONNINFRA_|CONFIG_WARP_|CONFIG_first_card|CONFIG_PACKAGE_(kmod-mt_wifi|kmod-warp|kmod-conninfra|wifi-dats|mtwifi))" .config >&2 || true
+            exit 1
+          }
+
+          # 包：缺一个就会编出「没有 WiFi 的固件」
+          for symbol in \
+            CONFIG_TARGET_mediatek_filogic_DEVICE_kst_wf3000a \
+            CONFIG_PACKAGE_kmod-mediatek_hnat \
+            CONFIG_PACKAGE_luci \
+            CONFIG_LUCI_LANG_zh_Hans \
+            CONFIG_PACKAGE_kmod-mt_wifi \
+            CONFIG_PACKAGE_kmod-warp \
+            CONFIG_PACKAGE_kmod-conninfra \
+            CONFIG_PACKAGE_wifi-dats \
+            CONFIG_PACKAGE_mtwifi-cfg \
+            CONFIG_PACKAGE_wifi-scripts ; do
+            grep -qx "${symbol}=y" .config || fail "$symbol"
+          done
+
+          # 驱动开关：带值校验（缺了同样不报错，只是没无线）
+          for kv in \
+            'CONFIG_MTK_CHIP_MT7981=y' \
+            'CONFIG_MTK_FIRST_IF_MT7981=y' \
+            'CONFIG_MTK_WIFI_DRIVER=y' \
+            'CONFIG_MTK_WIFI_FW_BIN_LOAD=y' \
+            'CONFIG_MTK_MT7981_NEW_FW=y' \
+            'CONFIG_first_card_name="MT7981"' ; do
+            grep -qxF "$kv" .config || fail "$kv"
+          done
+
+          # 三态符号：=m 或 =y 都算通过，避免上游改值导致误报
+          for sym in CONFIG_MTK_MT_WIFI CONFIG_MTK_MT_AP_SUPPORT CONFIG_MTK_WIFI_MODE_AP; do
+            grep -qxF "${sym}=m" .config || grep -qxF "${sym}=y" .config || fail "$sym (m/y)"
+          done
+          echo "硬校验通过：机型 / HNAT / LuCI / 中文 / MTK 无线驱动 均已选中"
+
+          # 双名组（24.10 改名的包，两个名字有其一即通过）
+          check_renamed() {
+            local label="$1"; shift
+            for symbol in "$@"; do
+              grep -qx "${symbol}=y" .config && { echo "双名组 OK：$label → $symbol"; return; }
+            done
+            echo "::error::$label 新旧名字都未生效（$*）" >&2; exit 1
+          }
+          check_renamed "LuCI 软件包页面" \
+            CONFIG_PACKAGE_luci-app-package-manager CONFIG_PACKAGE_luci-app-opkg
+          check_renamed "软件包页面中文化" \
+            CONFIG_PACKAGE_luci-i18n-package-manager-zh-cn CONFIG_PACKAGE_luci-i18n-opkg-zh-cn
+
+          # 软校验：缺了不致命，只提醒
+          for symbol in \
+            CONFIG_PACKAGE_opkg \
+            CONFIG_PACKAGE_ca-bundle \
+            CONFIG_PACKAGE_ca-certificates \
+            CONFIG_PACKAGE_libustream-openssl \
+            CONFIG_PACKAGE_luci-app-firewall \
+            CONFIG_PACKAGE_kmod-nft-offload \
+            CONFIG_PACKAGE_ppp-mod-pppoe ; do
+            grep -qx "${symbol}=y" .config \
+              || echo "::warning::$symbol 未选中（opkg 可能无法访问 https 源，届时改用 http 源）"
+          done
+
+          ./scripts/diffconfig.sh | tee "$GITHUB_WORKSPACE/build.diffconfig"
+
+      # ── 9. 预下载源码包 ───────────────────────────────────
+      - name: Download sources
+        working-directory: ${{ runner.temp }}/wf3000a-build/openwrt
+        run: |
+          make download -j8
+          find dl -type f -size -1024c -print -delete
+
+      # ── 10. 编译 ──────────────────────────────────────────
+      - name: Build firmware
+        working-directory: ${{ runner.temp }}/wf3000a-build/openwrt
+        run: |
+          set -o pipefail
+          mkdir -p "$GITHUB_WORKSPACE/_logs"
+          # 并行失败则回退单线程 V=s 重跑，便于定位错误
+          if make -j"$(nproc)" 2>&1 | tee "$GITHUB_WORKSPACE/_logs/build-j.log"; then
+            echo "并行编译成功"
+          else
+            echo "::warning::并行编译失败，回退单线程 V=s 重跑"
+            make -j1 V=s 2>&1 | tee "$GITHUB_WORKSPACE/_logs/build-1.log"
+          fi
+
+      # ── 11. 失败诊断（自动触发，把错误行顶到日志末尾）──────
+      - name: Diagnose build failure
+        if: ${{ failure() }}
+        working-directory: ${{ runner.temp }}/wf3000a-build/openwrt
+        run: |
+          echo "── 磁盘 ──"; df -h
+          echo "── 目录体积 ──"; du -sh build_dir staging_dir dl 2>/dev/null
+          for f in "$GITHUB_WORKSPACE/_logs/build-1.log" "$GITHUB_WORKSPACE/_logs/build-j.log"; do
+            [ -s "$f" ] || continue
+            echo "── 最后 120 行 ──"; tail -120 "$f"
+            echo "── 错误行 ──"
+            grep -nE "Error [0-9]+|error:|No such file|undefined reference|collect2:|\*\*\*" "$f" | tail -40
+            break
+          done
+
+      # ── 12. ★ 无线校验 ③：产物自检（上传前）─────────────────
+      #     编译成功 ≠ 有 WiFi。查 manifest + rootfs 里的固件。
+      - name: Assert wireless present in image
+        working-directory: ${{ runner.temp }}/wf3000a-build/openwrt
+        run: |
+          manifest="$(ls bin/targets/mediatek/filogic/*.manifest 2>/dev/null | head -1)"
+          [ -n "$manifest" ] || { echo "::error::找不到 manifest，产物异常" >&2; exit 1; }
+          echo "manifest: $manifest"
+          miss=0
+          for pkg in kmod-mt_wifi kmod-warp kmod-conninfra wifi-dats mtwifi-cfg; do
+            if grep -qE "^${pkg} " "$manifest"; then echo "  [OK]   $pkg"
+            else echo "  [FAIL] $pkg"; miss=1; fi
+          done
+          [ "$miss" -eq 0 ] || { echo "::error::镜像里缺少无线包" >&2; exit 1; }
+
+          rootfs="$(find staging_dir -maxdepth 6 -type d -name 'root-mediatek' -print -quit 2>/dev/null)"
+          if [ -z "$rootfs" ]; then
+            echo "::warning::未定位到 root-mediatek，跳过固件文件检查"
+          else
+            miss2=0
+            for f in WIFI_RAM_CODE_MT7981.bin 7981_WACPU_RAM_CODE_release.bin mt7981_patch_e1_hdr.bin; do
+              [ -e "$rootfs/lib/firmware/$f" ] && echo "  [OK]   $f" \
+                || { echo "  [FAIL] $f"; miss2=1; }
+            done
+            [ "$miss2" -eq 0 ] || {
+              echo "::error::rootfs 缺少 MT7981 无线固件" >&2; exit 1; }
+            # 运行期覆盖偏移的 .dat
+            ls "$rootfs/etc/wireless/l1profile.dat" 2>/dev/null \
+              && echo "  [OK]   l1profile.dat" \
+              || echo "::warning::未找到 /etc/wireless/l1profile.dat"
+          fi
+          echo "产物无线自检通过：驱动 + 固件齐备"
+
+      # ── 13. 收集产物 + 校验和 ─────────────────────────────
+      - name: Collect firmware and checksums
+        id: collect
+        run: |
+          firmware_dir="$OPENWRT/bin/targets/mediatek/filogic"
+          test -d "$firmware_dir"
+          rm -rf "$firmware_dir/packages"
+          cp build.diffconfig "$firmware_dir/wf3000a-build.diffconfig"
+          (
+            cd "$firmware_dir"
+            find . -maxdepth 1 -type f ! -name sha256sums.txt -print0 \
+              | sort -z | xargs -0 sha256sum > sha256sums.txt
+          )
+          echo "firmware_dir=$firmware_dir" >> "$GITHUB_OUTPUT"
+          echo "release_tag=wf3000a-$(date +'%Y.%m.%d-%H%M')" >> "$GITHUB_OUTPUT"
+
+          # ── 产物清单（刷机前先看这里，确认有哪些文件、多大）──
+          echo "───── 产物清单 ─────"
+          ls -la "$firmware_dir"
+          echo "───── .bin 固件 ─────"
+          find "$firmware_dir" -maxdepth 1 -name '*.bin' -printf '%f  %s bytes\n'
+          n=$(find "$firmware_dir" -maxdepth 1 -name '*.bin' | wc -l)
+          [ "$n" -gt 0 ] || {
+            echo "::error::产物里没有任何 .bin —— 镜像生成失败，不要刷" >&2
+            exit 1; }
+          echo "共 $n 个 .bin"
+
+      # v5 仍打包在 Node 20 上，runner 已强制 Node 24 → 每次都刷一条弃用警告。
+      # v7.0.2 是官方最新（v6.0.0 起 runs.using: node24）；
+      # name / path / if-no-files-found / retention-days 参数均未变。
+      - name: Upload firmware artifact
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: WF3000A-ImmortalWrt-6.6-${{ github.run_number }}
+          path: ${{ steps.collect.outputs.firmware_dir }}
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish GitHub Release
+        if: ${{ inputs.publish_release }}
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ steps.collect.outputs.release_tag }}
+          name: WF3000A ImmortalWrt 6.6 ${{ steps.collect.outputs.release_tag }}
+          body: |
+            Source: wangwang623/immortalwrt-mt798x-6.6 (fork of padavanonly)
+            Ref: ${{ inputs.source_ref }}
+            Layout: nmbm0:1024k(bl2),512k(u-boot-env),2048k(factory),2048k(fip),116736k(ubi)
+            MAC: LAN=48:da:35:50:70:f5  WAN=48:da:35:50:70:f6
+            Wireless: MTK 闭源驱动 kmod-mt_wifi + kmod-warp + kmod-conninfra + wifi-dats
+
+            纯净固件：官方默认包 + LuCI(中文) + HNAT 硬件加速 + 无线驱动/固件，无第三方插件。
+            首次刷入：U-Boot Web（192.168.1.1，布局选 114m）上传 factory.bin
+
+          # ★ 必须显式给 files:，否则发布的是一个【空的 Release】——
+          #   只有说明文字、没有任何附件。这是上一版"编译成功却没有 bin"的原因。
+          files: ${{ steps.collect.outputs.firmware_dir }}/*
