@@ -1,4 +1,4 @@
-# WF3000A ImmortalWrt 6.6 云编译工程（纯净固件）
+# KST-WF3000A ImmortalWrt 6.6 云编译工程（纯净固件）
 
 通过 GitHub Actions 云编译 **KST WF3000A**（MT7981B + 256MB RAM + 128MB Flash）的
 ImmortalWrt 24.10 / Linux 6.6 固件。
