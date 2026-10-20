@@ -223,12 +223,14 @@ if not SKIP_TREE:
     chk('kst,wf3000a|\\' in net, "接口分组已并入（续行）")
     chk('ucidef_set_interfaces_lan_wan "lan1 lan2 lan3" wan' in net, "接口动作串正确")
     # MAC 必须是【从 factory 推导】，不能硬编码本机 MAC
+    # 规则：基准 = factory 0x04（2.4G），LAN = 基准-1，WAN = 基准-2
     chk("mtd_get_mac_binary" in net, "MAC 从 factory 读取（非硬编码）")
-    chk("base_mac=$(mtd_get_mac_binary factory 0x04)" in net,
-        "基准偏移 = factory:0x04（2.4G 无线 MAC）")
-    chk('lan_mac=$(macaddr_add "$base_mac" -2)' in net, "LAN = base - 2")
-    chk('wan_mac=$(macaddr_add "$base_mac" -1)' in net, "WAN = base - 1")
-    chk(not any(m in net for m in ("48:da:35:50:70:f5", "48:da:35:50:70:f6")),
+    chk("base_mac=$(mtd_get_mac_binary factory 4)" in net,
+        "基准偏移 = factory:4 即 0x04（2.4G 无线 MAC）")
+    chk('lan_mac=$(macaddr_add "$base_mac" -1)' in net, "LAN = base - 1")
+    chk('wan_mac=$(macaddr_add "$base_mac" -2)' in net, "WAN = base - 2")
+    chk(not any(m in net for m in ("48:da:35:50:70:f5", "48:da:35:50:70:f6",
+                                   "48:da:35:50:70:f7", "48:da:35:50:70:f8")),
         "未残留本机 MAC 硬编码")
 
     plat = (S / "filogic/base-files/lib/upgrade/platform.sh").read_text()
