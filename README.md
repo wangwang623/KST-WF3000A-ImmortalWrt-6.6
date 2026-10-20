@@ -8,6 +8,29 @@ ImmortalWrt 24.10 / Linux 6.6 固件。
 
 ---
 
+## 方案：源码用上游官方源，移植改动在 CI 里打
+
+| | 内容 |
+|---|---|
+| **源码** | <https://github.com/padavanonly/immortalwrt-mt798x-6.6>（**上游官方，原样不动**） |
+| **本仓库** | DTS / device.mk / 补丁脚本 / config / workflow |
+
+### 为什么这样选
+
+**好处：源码零维护。** 不需要维护 fork，没有同步、没有冲突。
+换版本只改 workflow 的 `source_ref` 输入框（分支名或 commit SHA）即可。
+
+**代价：依赖查找替换。** DTS 复制、`filogic.mk` 追加、`02_network` 与
+`platform.sh` 的插入全靠正则 / 锚点定位，上游改文件格式时可能失配。
+
+为降低这个代价，脚本做了分级处理：
+
+- 致命项（DTS / 机型注册 / MAC）**严格失败**
+- 非致命项（sysupgrade）**降级为警告**，避免误判成编译错误
+- 打完补丁后逐条复核，缺哪项报哪项
+
+---
+
 ## 硬件与布局
 
 | 项目 | 值 |
@@ -26,8 +49,6 @@ expand(114m): nmbm0:1024k(bl2),512k(u-boot-env),2048k(factory),2048k(fip),116736
 ```
 
 **本工程只编译 `expand(114m)` 这一种。** 刷机时 U-Boot 布局也必须选 **114m**，两者必须对应。
-
-对应十六进制：
 
 | 分区 | 起始 | 大小 |
 |---|---:|---:|
@@ -65,64 +86,23 @@ U-Boot 下载地址：
 
 | 项目 | 地址 | 说明 |
 |---|---|---|
-| 源码（上游） | <https://github.com/padavanonly/immortalwrt-mt798x-6.6> | ImmortalWrt 24.10 + 内核 6.6，含 MTK 闭源无线驱动 |
-| 源码（本工程使用） | <https://github.com/wangwang623/immortalwrt-mt798x-6.6> | 上游的 fork，**不做任何修改**，仅用于固定源码引用 |
+| 源码（本工程使用） | <https://github.com/padavanonly/immortalwrt-mt798x-6.6> | **直接用上游官方源**，ImmortalWrt 24.10 + 内核 6.6，含 MTK 闭源无线驱动 |
 | 参考工程 A | <https://github.com/Anser-y/WF3000A-ImmortalWrt-6.6> | WF3000A 移植的早期版本（大分区布局 + 大量插件） |
 | 参考工程 B | 恩山无线论坛「小圆」的 WF3000A 固件 | 同为 padavanonly 6.6 源码，114M 布局，**有线/无线实测可用** |
 | U-Boot | <https://github.com/VIKINGYFY/UBOOT-CI> | 多分区 U-Boot（含 114m 布局） |
 | 项目文档 | <https://cmi.hanwckf.top/p/immortalwrt-mt798x/> | ImmortalWrt-MT798X 项目介绍（hanwckf） |
 
-### 本工程与两个参考工程的差异
+### 与两个参考工程的差异
 
 | | Anser-y | 小圆 | **本工程** |
 |---|---|---|---|
 | Flash 布局 | 大分区 | 114M（另有一个大分区变体） | **114M（单一）** |
 | 插件 | 大量（PassWall / AdGuardHome / Tailscale 等） | 较多 | **无（纯净）** |
-| MAC | 硬编码 | **随机**（DTS 缺 nvmem-cells） | **每台机器各自推导**（factory 偏移 + 增量） |
+| MAC | 硬编码 | **随机**（DTS 缺 nvmem-cells） | **每台机器各自推导** |
 | 无线来源 | config 无无线配置 | 基于上游 defconfig | 同小圆：抄 `defconfig/mt7981-ax3000.config` |
 
 > ⚠️ Anser-y 那份 `config/wf3000a.config` 里**没有任何无线配置**，
 > 不能作为"无线正常"的参照物。
-
----
-
-## 核心机制：源码仓库保持干净，补丁在 CI 里打
-
-**`immortalwrt-mt798x-6.6` 源码一个字节都不手动改。**
-所有移植改动由 `scripts/prepare-source.py` 在克隆之后、编译之前完成。
-
-好处：源码可随意换版本，不用维护一整套 fork 差异。
-代价：依赖锚点定位，上游改动文件格式时会失配——
-所以脚本对致命项（DTS / 机型注册 / MAC）严格失败，对非致命项降级为警告。
-
-### 目录
-
-```
-.github/workflows/build.yml     工作流（拉源码 → 打补丁 → 校验 → 编译）
-config/wf3000a.config           固件配置（意图清单：只列要的）
-custom/wf3000a/
-  mt7981b-kst-wf3000a.dts       ①设备树：114MiB 分区 + 端口 + MAC nvmem
-  device.mk                     ②镜像定义：机型注册 + IMAGE_SIZE + KERNEL
-  02_network                    【参考】打完补丁后的完整文件
-  platform.sh                   【参考】打完补丁后的完整文件
-scripts/prepare-source.py       ★ 打补丁 + 复核（核心）
-scripts/simulate.py             本地模拟运行（不用等 CI）
-开ssh和救砖/                     解锁 SSH 与串口救砖资料
-```
-
-`custom/wf3000a/` 下的 `02_network` 和 `platform.sh` **只用于查看补丁效果**，
-脚本不会复制它们——它会自己在源码文件上做插入。
-
-### 脚本做的四件事
-
-| # | 动作 | 目标文件 | 为什么 |
-|---|---|---|---|
-| 1 | 复制 DTS | `mediatek/dts/mt7981b-kst-wf3000a.dts` | 分区 / 端口 / GPIO / MAC 全靠它 |
-| 2 | 追加镜像定义 | `mediatek/image/filogic.mk` | **让 config 符号存在** |
-| 3 | 改网络配置 | `filogic/base-files/etc/board.d/02_network` | 端口划分 + MAC |
-| 4 | 改升级脚本 | `filogic/base-files/lib/upgrade/platform.sh` | 打通 sysupgrade |
-
-打完补丁后逐条复核，缺哪项报哪项——**不会编出一台"别的机型"的固件**。
 
 ---
 
@@ -137,7 +117,7 @@ scripts/simulate.py             本地模拟运行（不用等 CI）
 `mt7981-wo-firmware` 全是**死引用**，会被 `make defconfig` 静默丢弃——
 **这正是最初"固件没有无线"的根因**。
 
-本源码真正可用的无线是 **MTK 闭源驱动**，包都在仓库里：
+本源码真正可用的无线是 **MTK 闭源驱动**：
 
 | 包 | 路径 | 作用 |
 |---|---|---|
@@ -185,18 +165,15 @@ WAN  = base - 2
 
 ### 为什么不硬编码
 
-硬编码 `48:da:35:50:70:f5` 会把**本机**的 MAC 写进固件。
-别人刷了这份固件，就会与本机构成 **MAC 冲突**（同网段两台设备同 MAC）。
-
+硬编码会把本机 MAC 写死进固件，别人刷了就跟你**撞 MAC**（同网段两台设备同 MAC）。
 从每台机器自己的 factory 读取 → 每台机器得到自己的 MAC，**固件可公开分发**。
 
 ### 实现方式
 
-`02_network` 里的 `kst,wf3000a` 分支：
+由 `scripts/prepare-source.py` 插入 `02_network` 的分支：
 
 ```sh
 kst,wf3000a)
-	# 以 2.4G 无线 MAC 为基准推导，每台机器各不相同
 	base_mac=$(mtd_get_mac_binary factory 4)
 	lan_mac=$(macaddr_add "$base_mac" -1)
 	wan_mac=$(macaddr_add "$base_mac" -2)
@@ -208,21 +185,10 @@ kst,wf3000a)
 > 这份源码的 `/lib/functions/system.sh` 只有 `macaddr_add`，**没有** `macaddr_sub`。
 > `macaddr_add` 内部是 `(0x<nic> + val) & 0xffffff`，传负数靠补码回绕，等价减法：
 > ```
-> 0x5070f7 + (-1) & 0xffffff = 0x5070f6   → LAN ...:70:f6
-> 0x5070f7 + (-2) & 0xffffff = 0x5070f5   → WAN ...:70:f5
+> 0x5070f7 + (-1) & 0xffffff = 0x5070f6   → LAN
+> 0x5070f7 + (-2) & 0xffffff = 0x5070f5   → WAN
 > ```
-> 已用源码原始实现实测验证，跨字节借位也正确。
-
-### 无线 MAC
-
-2.4G / 5G 的 MAC 由**闭源驱动直接从 EEPROM 读**（`0x04` / `0x0a`），
-不经过 `02_network`，无需处理。
-
-### DTS 部分
-
-`gmac0` / `gmac1` 挂 `nvmem-cells = <&macaddr_factory_4>`（同样从 factory `0x04` 读）。
-
-> 这就是"MAC 随机"问题的解法——小圆那版 DTS 里没有 nvmem-cells，所以 MAC 是随机的。
+> 源码自带的 02_network 里就有 `macaddr_add "$lan_mac" -2` 的用法，实测可行。
 
 ---
 
@@ -230,8 +196,8 @@ kst,wf3000a)
 
 1. 本目录内容作为**独立仓库**上传到 GitHub
 2. **Settings → Actions → General → Workflow permissions** 勾 **Read and write**
-3. Actions → `Build WF3000A ImmortalWrt 6.6` → **Run workflow**
-   - `source_ref`：源码分支名或 commit SHA（默认 `openwrt-24.10-6.6`）
+3. Actions → `Build KST-WF3000A ImmortalWrt 6.6` → **Run workflow**
+   - `source_ref`：上游源码的分支名或 commit SHA（默认 `openwrt-24.10-6.6`）
    - `publish_release`：是否发布 GitHub Release
 4. 等 1~2 小时，产物在 **Artifacts**
 
@@ -245,14 +211,47 @@ immortalwrt-...-mediatek-filogic-kst_wf3000a-squashfs-sysupgrade.bin
 
 ### 关于源码版本
 
-`source_ref` 默认填**分支名**，会跟着源码仓库变动，以便跟进上游更新。
+`source_ref` 填**分支名**会跟着上游变动，可跟进安全更新和内核升级。
 
-若需要**复现某次成功构建**：打开那次运行的 Release，body 里记录了
-实际使用的 `Commit`（短 SHA）与 `Kernel` 版本，把它填进 `source_ref` 即可锁死。
+若需要**复现某次成功构建**：打开那次运行的 Release，body 里记录了实际使用的
+`Commit`（短 SHA）与 `Kernel` 版本，把它填进 `source_ref` 即可锁死版本。
 
-源码同步上游后若 `defconfig/mt7981-ax3000.config` 有变更，
-workflow 第 7 步（`Cross-check MTK symbols`）会在几分钟内报错并列出差异——
-它兼作**上游变更警报器**。
+因为源码是上游官方源，**不存在同步冲突问题**——但反过来，上游改版可能让
+补丁脚本失配，这时第 5 步会明确报错指出是哪一处没匹配上。
+
+---
+
+## 目录结构
+
+```
+.github/workflows/build.yml     云编译流程
+config/wf3000a.config           构建配置（意图清单）
+custom/wf3000a/
+  mt7981b-kst-wf3000a.dts       ①设备树（新增）
+  device.mk                     ②机型定义（追加到 filogic.mk）
+  02_network                    ③参考：打完补丁后的样子
+  platform.sh                   ④参考：打完补丁后的样子
+scripts/
+  prepare-source.py             打补丁 + 事后复核
+  simulate.py                   本地模拟（不需要真的编译）
+```
+
+`custom/wf3000a/` 里的 `02_network` 和 `platform.sh` 是**参考文件**——
+云编译不读它们（`prepare-source.py` 直接在源码文件上做插入），
+只有 `simulate.py` 会读，用来反推"未打补丁"的版本做对照测试。
+
+---
+
+## 本地模拟（可选）
+
+不用 GitHub Actions、不用真的编译，就能验证补丁逻辑：
+
+```bash
+python3 scripts/simulate.py
+```
+
+会检查：脚本语法、YAML、config 格式、补丁后的 shell 语法、
+补丁位置正确性、幂等性，以及多个「异常场景」能否被正确拦住。
 
 ---
 
@@ -288,43 +287,27 @@ sysupgrade -n /tmp/xxx-sysupgrade.bin
 ### 验证
 
 ```sh
-# 下面两个应相差 1，且都比 2.4G 无线 MAC 小（LAN 小 1、WAN 小 2）
 cat /sys/class/net/lan1/address   # 本机示例 48:da:35:50:70:f6
 cat /sys/class/net/wan/address    # 本机示例 48:da:35:50:70:f5
-
-# 基准（2.4G）可从 factory 直接读出来对照
-hexdump -C -n 16 /dev/mtd2        # factory：0x04 = ...F7，0x0a = ...F8
+hexdump -C -n 16 /dev/mtd2        # 基准：0x04 = ...F7
 dmesg | grep -iE "mt_wifi|warp|conninfra|eeprom"
 ```
 
 ---
 
-## 本地模拟运行（推荐先跑一遍）
+## workflow 的四道校验
 
-不用等 CI、不用真编译，几十秒验证整条链路：
+都不改变编译行为，只在有问题时**提前失败**——避免「编译两小时、刷机才发现没 WiFi」。
 
-```bash
-python3 scripts/simulate.py
-```
+| 步骤 | 时机 | 检查 |
+|---|---|---|
+| 第 5 步 | 编译前 | 打补丁 + 事后复核（DTS / 机型 / MAC / sysupgrade / 无线包） |
+| 第 6 步 | defconfig 前 | 5 个无线包 + MT7981 固件 + l1profile.dat |
+| 第 8 步 | defconfig 前 | config 的 MTK 驱动符号与上游 defconfig **双向**比对 |
+| 第 9 步 | defconfig 后 | 无线包是否被静默丢弃 |
+| 第 12 步 | 编译后 | manifest 含无线包 + rootfs 含固件 bin |
 
-它会：
-
-1. 校验 `prepare-source.py` / `build.yml` / 两个 shell 参考文件的语法
-2. 建一棵模拟源码树，跑一遍打补丁，检查补丁位置与续行链
-3. 模拟 `make defconfig` 的符号解析，跑硬校验 / 软校验
-4. 跑多个场景（全部可用 / 软项缺失 / 机型符号丢失 / 无线包缺失 …）
-5. 检查幂等性（重复运行是否报错停止）
-
-也可以直接对真实源码跑打补丁脚本：
-
-```bash
-git clone --depth=1 -b openwrt-24.10-6.6 \
-  https://github.com/wangwang623/immortalwrt-mt798x-6.6
-python3 scripts/prepare-source.py ./immortalwrt-mt798x-6.6
-```
-
-⚠️ 脚本**不能重复运行**——第二次会因 `filogic.mk` 里已有 `kst_wf3000a`
-直接报明确错误停下（而不是生成错误固件）。CI 每次都是全新克隆，不会遇到。
+失败时第 11 步会自动打印磁盘、目录体积、最后 120 行日志和 grep 出的错误行。
 
 ---
 
@@ -356,28 +339,24 @@ ERROR: package/mtk/drivers/mt_wifi failed to build.
 ```
 
 **只比对"我写了什么"不够，还要比对"上游禁用了什么"。**
-workflow 第 7 步会做这个双向比对，有差异直接拦下。
+workflow 第 8 步会做这个双向比对，有差异直接拦下。
 
 ---
 
 ## 编进固件 vs 事后安装
 
-判断标准（这条决定了 config 里该写什么）：
-
 | 类型 | 编进去？ | 理由 |
 |---|---|---|
 | `kmod-*` | **必须** | 与内核版本强绑定，事后 `opkg install` 必然失败 |
-| `ca-bundle` / `ca-certificates` | **必须** | 否则 opkg 连不上 https 源，「按需安装」本身不成立 |
-| `CONFIG_LUCI_LANG_zh_Hans` | **必须** | 不是插件，是 LuCI 的语言配置项，必须编译期确定 |
-| 无线驱动 / 固件 | **必须** | 否则没有 WiFi（见上文） |
+| `ca-bundle` / `ca-certificates` | **必须** | 否则 opkg 连不上 https 源 |
+| `CONFIG_LUCI_LANG_zh_Hans` | **必须** | 不是插件，是 LuCI 的语言配置项 |
+| 无线驱动 / 固件 | **必须** | 否则没有 WiFi |
 | `luci` | 建议 | 让机器可用的基础 |
 | `luci-app-*` | 不必 | 纯脚本/二进制，随时 `opkg install` |
 | 界面语言、主题 | 不必 | 同上 |
 
-所以当前 config 只编这几类：**机型 + HNAT(kmod) + 无线驱动/固件 + LuCI(含 https 依赖)**。
-
 想确认最终编了什么：看 workflow 输出的 `build.diffconfig`，
-或刷完后在路由器上跑 `opkg list-installed`。
+或刷完后跑 `opkg list-installed`。
 
 ---
 
@@ -399,22 +378,42 @@ opkg install zram-swap                                   # 内存压缩
 ⚠️ 带 `kmod-*` 的包（如 `kmod-wireguard`）必须重新编译后刷入，
 事后装会因内核版本不匹配失败。
 
-### 两个常见疑问
+> **`luci-ssl` 与 `ca-bundle` 别搞混**：
+> `luci-ssl` 是入站 HTTPS（浏览器 → 管理页），`ca-bundle` 是出站 HTTPS（路由器 → 软件源）。
+> 方向相反。本工程**保留**了 ca-bundle，**省略**了 luci-ssl（家内 http 够用）。
 
-**`luci-app-package-manager`**（LuCI 里的「软件包」页面）：
-不是基础系统包，是 luci-app 类插件。缺了 LuCI 里没有该菜单，
-**不影响**从 SSH 用 `opkg install`。随时能补。
+---
 
-**`luci-ssl`**（让 LuCI 走 HTTPS）：
-元包，拉进 `uhttpd-mod-tls` + SSL 后端 + `px5g`（自签证书）。
-缺了 LuCI 只能 `http://` 访问，家内局域网无所谓。随时能补。
+## 附：源码本地编译步骤（参考上游官方 README）
 
-⚠️ 别把它和 `ca-bundle` 搞混：
+本项目走 GitHub Actions 云编译，不需要本地编译。若想在本机编译，
+参考上游 <https://github.com/padavanonly/immortalwrt-mt798x-6.6> 的 Quickstart：
 
-```
-luci-ssl     →  入站 HTTPS：浏览器 ──▶ 路由器管理页
-ca-bundle    →  出站 HTTPS：路由器 ──▶ 软件源下载插件
-```
+1. 克隆源码
+   ```bash
+   git clone -b openwrt-24.10-6.6 --single-branch --filter=blob:none \
+     https://github.com/padavanonly/immortalwrt-mt798x-6.6
+   cd immortalwrt-mt798x-6.6
+   ```
+2. 更新并安装 feeds
+   ```bash
+   ./scripts/feeds update -a
+   ./scripts/feeds install -a
+   ```
+3. 载入配置
+   ```bash
+   cp -f defconfig/mt7981-ax3000.config .config
+   ```
+4. 编译
+   ```bash
+   make -j$(nproc)
+   ```
 
-方向相反、用途不同。本工程**保留**了出站用的 ca-bundle / ca-certificates，
-**省略**了入站用的 luci-ssl。
+注意（来自官方 README）：
+
+- 用**非 root 用户**操作，不要 sudo
+- PATH 和工作目录**不能有空格或非 ASCII 字符**
+- 至少 4GB 内存、25GB 磁盘，且能联网
+- Debian 11 优先，需 AMD64 架构
+
+若在 WSL 下编译，需移除 PATH 中的 Windows 目录。
