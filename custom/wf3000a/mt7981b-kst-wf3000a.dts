@@ -1,0 +1,330 @@
+// SPDX-License-Identifier: GPL-2.0-or-later OR MIT
+/*
+ * KST-WF3000A support ported to the MediaTek filogic / Linux 6.6 tree.
+ * Original board description: Tianling Shen <cnsztl@immortalwrt.org>
+ *
+ * 本文件相对 Anser-y 原版只改了两处（均可搜 "CHANGED" 定位）：
+ *   1) model / compatible 描述里的 248MiB -> 114MiB（纯文字，无功能影响）
+ *   2) ubi 分区 reg 长度 0x0f280000 -> 0x07200000
+ *   3) 在 factory 分区里补了一个 MAC 的 nvmem cell，并把 gmac0/gmac1 指向它
+ *      —— 这是修「MAC 地址随机」的关键，原版 DTS 完全没有这段
+ *   4) factory 分区改用 nvmem-layout，并给 &wifi 补上 nvmem-cells 指向
+ *      eeprom@0（校准数据）—— 与上游 6.6 源码里其它 MT7981 机型写法一致。
+ *      同时保留 mediatek,mtd-eeprom 作为兜底（mt76 优先用它，失败才回退 nvmem），
+ *      两种写法并存不会冲突。
+ *
+ * 第 3 点的偏移已实测确认 = 0x4（见文件末尾实测记录）。
+ *      cat /proc/mtd                      # 确认 factory 对应哪个 mtd
+ *      hexdump -C /dev/mtd2 | head -20    # (mtd2 换成实际的 factory)
+ *    找到形如 xx:xx:xx:xx:xx:xx 连续排列的 6 字节，记下它的起始偏移，
+ *    若你的机器实测到不同偏移，把 reg = <0x4 0x6> 里的 0x4 换掉。
+ *
+ * 分区校验：0x0580000 + 0x07200000 = 0x07780000 = 119.5 MiB，
+ * 与 hanwckf 系 U-Boot 的 expand(114m) 布局
+ *   nmbm0:1024k(bl2),512k(u-boot-env),2048k(factory),2048k(fip),116736k(ubi)
+ * 完全对齐。
+ *
+ * ── MAC 实测结果（2026-10-15，已在实机上验证）──────────────
+ * Factory 分区（mtd2）：
+ *   0x4  ->  48:DA:35:50:70:F7
+ *   0xa  ->  48:DA:35:50:70:F8
+ * 机身标签           =  48:DA:35:50:70:F5
+ *
+ * 即 factory 里只有两个无线 MAC（F7 = 2.4G，F8 = 5G），
+ * 以太网 MAC（F5 = LAN，F6 = WAN）不在这个分区里。
+ *
+ * 所以本文件里 gmac 绑定的 0x4 只能让内核先拿到一个「本机合法但不等于标签」
+ * 的 MAC（F7）。最终 LAN/WAN 的 MAC 由 02_network 决定（会覆盖这里的值），
+ * 建议按 02_network.snippet.txt 的「方案 A」硬编码成 F5 / F6。
+ */
+
+/dts-v1/;
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/input/input.h>
+#include <dt-bindings/leds/common.h>
+
+#include "mt7981.dtsi"
+
+/ {
+	model = "KST-WF3000A (NMBM 114MiB layout)";   /* CHANGED */
+	compatible = "kst,wf3000a", "mediatek,mt7981";
+
+	aliases {
+		serial0 = &uart0;
+		led-boot = &led_status_red;
+		led-failsafe = &led_status_red;
+		led-running = &led_status_green;
+		led-upgrade = &led_status_blue;
+	};
+
+	chosen {
+		stdout-path = "serial0:115200n8";
+	};
+
+	memory {
+		reg = <0 0x40000000 0 0x10000000>;   /* 256MB DDR3 */
+	};
+
+	gpio-keys {
+		compatible = "gpio-keys";
+
+		reset {
+			label = "reset";
+			linux,code = <KEY_RESTART>;
+			gpios = <&pio 1 GPIO_ACTIVE_LOW>;
+		};
+
+		wps {
+			label = "wps";
+			linux,code = <KEY_WPS_BUTTON>;
+			gpios = <&pio 0 GPIO_ACTIVE_LOW>;
+		};
+	};
+
+	leds {
+		compatible = "gpio-leds";
+
+		led_status_red: red {
+			function = LED_FUNCTION_STATUS;
+			color = <LED_COLOR_ID_RED>;
+			gpios = <&pio 10 GPIO_ACTIVE_LOW>;
+		};
+
+		led_status_green: green {
+			function = LED_FUNCTION_STATUS;
+			color = <LED_COLOR_ID_GREEN>;
+			gpios = <&pio 11 GPIO_ACTIVE_LOW>;
+		};
+
+		led_status_blue: blue {
+			function = LED_FUNCTION_STATUS;
+			color = <LED_COLOR_ID_BLUE>;
+			gpios = <&pio 12 GPIO_ACTIVE_LOW>;
+		};
+	};
+};
+
+&eth {
+	status = "okay";
+
+	gmac0: mac@0 {
+		compatible = "mediatek,eth-mac";
+		reg = <0>;
+		phy-mode = "2500base-x";
+
+		fixed-link {
+			speed = <2500>;
+			full-duplex;
+			pause;
+		};
+	};
+
+	gmac1: mac@1 {
+		compatible = "mediatek,eth-mac";
+		reg = <1>;
+		phy-mode = "2500base-x";
+
+		fixed-link {
+			speed = <2500>;
+			full-duplex;
+			pause;
+		};
+	};
+};
+
+/* CHANGED: 新增 —— 给以太网口绑定 factory 里的 MAC，根治「MAC 随机」 */
+&gmac0 {
+	nvmem-cells = <&macaddr_factory_4>;
+	nvmem-cell-names = "mac-address";
+};
+
+&gmac1 {
+	nvmem-cells = <&macaddr_factory_4>;
+	nvmem-cell-names = "mac-address";
+	/* WAN 通常用 label_mac + 1；若你希望 WAN 与 LAN 同 MAC，删掉下面这行 */
+	mac-address-increment = <1>;
+};
+
+&mdio_bus {
+	switch: switch@1f {
+		compatible = "mediatek,mt7531";
+		reg = <31>;
+		reset-gpios = <&pio 39 GPIO_ACTIVE_HIGH>;
+		interrupt-controller;
+		#interrupt-cells = <1>;
+		interrupt-parent = <&pio>;
+		interrupts = <38 IRQ_TYPE_LEVEL_HIGH>;
+	};
+};
+
+&switch {
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@0 {
+			reg = <0>;
+			label = "lan1";
+		};
+
+		port@1 {
+			reg = <1>;
+			label = "lan2";
+		};
+
+		port@2 {
+			reg = <2>;
+			label = "lan3";
+		};
+
+		port@3 {
+			reg = <3>;
+			label = "wan";
+		};
+
+		port@6 {
+			reg = <6>;
+			ethernet = <&gmac0>;
+			phy-mode = "2500base-x";
+
+			fixed-link {
+				speed = <2500>;
+				full-duplex;
+				pause;
+			};
+		};
+	};
+};
+
+&hnat {
+	mtketh-wan = "eth1";
+	mtketh-lan = "lan";
+	mtketh-ppd = "eth1";
+	mtketh-max-gmac = <2>;
+	status = "okay";
+};
+
+&spi0 {
+	pinctrl-names = "default";
+	pinctrl-0 = <&spi0_flash_pins>;
+	status = "okay";
+
+	spi_nand: spi_nand@0 {
+		compatible = "spi-nand";
+		#address-cells = <1>;
+		#size-cells = <1>;
+		reg = <0>;
+		spi-max-frequency = <52000000>;
+		spi-tx-bus-width = <4>;
+		spi-rx-bus-width = <4>;
+
+		mediatek,nmbm;
+		mediatek,bmt-max-ratio = <1>;
+		mediatek,bmt-max-reserved-blocks = <64>;
+
+		spi-cal-enable;
+		spi-cal-mode = "read-data";
+		spi-cal-datalen = <7>;
+		spi-cal-data = /bits/ 8 <0x53 0x50 0x49 0x4e 0x41 0x4e 0x44>;
+		spi-cal-addrlen = <5>;
+		spi-cal-addr = /bits/ 32 <0x0 0x0 0x0 0x0 0x0>;
+
+		partitions {
+			compatible = "fixed-partitions";
+			#address-cells = <1>;
+			#size-cells = <1>;
+
+			partition@0 {
+				label = "bl2";
+				reg = <0x0000000 0x0100000>;
+				read-only;
+			};
+
+			partition@100000 {
+				label = "u-boot-env";
+				reg = <0x0100000 0x0080000>;
+			};
+
+			factory: partition@180000 {
+				/* ⚠️ 标签不要改：闭源无线驱动的 mt_mtd_read_nm_wifi() 内部
+				   get_mtd_device_nm("Factory") 失败后会再试 "factory"，
+				   小写能命中第二个分支。read-only 也必须保留 —— 万一
+				   eeprom 校验失败，驱动会试图把默认 eeprom 写回 flash，
+				   read-only 会挡住这次写，保护原有 factory 数据。 */
+				label = "factory";
+				reg = <0x0180000 0x0200000>;
+				read-only;
+
+				/* CHANGED: 新增 —— 标准 nvmem 布局（MAC + 无线校准数据） */
+				nvmem-layout {
+					compatible = "fixed-layout";
+					#address-cells = <1>;
+					#size-cells = <1>;
+
+					/* 无线 EEPROM / 校准数据：mt76 通过 nvmem cell "eeprom" 读取 */
+					eeprom_factory_0: eeprom@0 {
+						reg = <0x0 0x1000>;
+					};
+
+					/* 以太网 MAC：实测 48:DA:35:50:70:F7 */
+					macaddr_factory_4: macaddr@4 {
+						reg = <0x4 0x6>;
+					};
+				};
+			};
+
+			partition@380000 {
+				label = "fip";
+				reg = <0x0380000 0x0200000>;
+				read-only;
+			};
+
+			partition@580000 {
+				label = "ubi";
+				reg = <0x0580000 0x07200000>;   /* CHANGED: 原为 0x0f280000 (248MiB) */
+			};
+		};
+	};
+};
+
+&pio {
+	spi0_flash_pins: spi0-pins {
+		mux {
+			function = "spi";
+			groups = "spi0", "spi0_wp_hold";
+		};
+
+		conf-pu {
+			pins = "SPI0_CS", "SPI0_HOLD", "SPI0_WP";
+			drive-strength = <8>;
+			mediatek,pull-up-adv = <0>;
+		};
+
+		conf-pd {
+			pins = "SPI0_CLK", "SPI0_MOSI", "SPI0_MISO";
+			drive-strength = <8>;
+			mediatek,pull-up-adv = <0>;
+		};
+	};
+};
+
+&uart0 {
+	status = "okay";
+};
+
+&watchdog {
+	status = "okay";
+};
+
+&wifi {
+	status = "okay";
+	/* 说明：本源码用 MTK 闭源驱动(mt_wifi)，它【不读】这个节点的 eeprom 属性，
+	   而是按 CONFIG_MTK_RT_FIRST_IF_RF_OFFSET 直接从 flash 读校准数据。
+	   这里保留两种标准写法（对闭源驱动无害）：
+	     - nvmem cells：与上游 6.6 的 MT7981 机型写法一致
+	     - mediatek,mtd-eeprom：老写法，开源 mt76 会用它
+	   将来若改用开源 mt76 驱动，这段就立刻生效，无需再改。 */
+	nvmem-cells = <&eeprom_factory_0>;
+	nvmem-cell-names = "eeprom";
+	mediatek,mtd-eeprom = <&factory 0x0>;
+};
