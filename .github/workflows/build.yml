@@ -31,7 +31,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  SOURCE_REPO: https://github.com/wangwang623/immortalwrt-mt798x-6.6.git
+  SOURCE_REPO: https://github.com/padavanonly/immortalwrt-mt798x-6.6.git
   TZ: Asia/Shanghai
 
 jobs:
