@@ -244,8 +244,14 @@ mediatek_setup_macs()
 		label_mac=$lan_mac
 		;;
 	kst,wf3000a)
-		lan_mac="48:da:35:50:70:f5"
-		wan_mac="48:da:35:50:70:f6"
+		# MAC 按 factory 偏移动态推算：每台机器各不相同，不会与他人冲突
+		#   基准 = factory 偏移 0x04（2.4G 无线 MAC，本机 = ...:F7）
+		#   LAN  = 基准 - 1   （本机 = ...:F6）
+		#   WAN  = 基准 - 2   （本机 = ...:F5，与机身标签一致）
+		# 注意：factory 里只有 0x04 / 0x0a 两个无线 MAC，没有 F5，只能推算。
+		base_mac=$(mtd_get_mac_binary factory 4)
+		lan_mac=$(macaddr_add "$base_mac" -1)
+		wan_mac=$(macaddr_add "$base_mac" -2)
 		label_mac=$lan_mac
 		;;
 	qihoo,360t7)
