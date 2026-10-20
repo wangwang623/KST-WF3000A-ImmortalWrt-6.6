@@ -1,12 +1,16 @@
 name: Build KST-WF3000A ImmortalWrt 6.6
 
 # ══════════════════════════════════════════════════════════════
-# 模式：源码仓库保持原样，所有移植改动由 prepare-source.py 在
-#       克隆之后、编译之前完成。
+# 模式：源码用【上游官方源】，保持原样不做任何修改。
+#       所有板级移植改动由 prepare-source.py 在克隆之后、编译之前完成。
 #
-# 相对于原版只多了三处无线校验（6 / 8 / 12 步），目的是防止
-# 「编译成功但没 WiFi」——那正是之前的坑，且要几十分钟后刷机才发现。
-# 这三处都不改变编译行为，只在有问题时提前失败。
+# 好处：源码零维护 —— 换版本只改 source_ref，没有 fork 同步 / 冲突问题
+# 代价：依赖正则/锚点定位，上游改文件格式时可能失配
+#       → 脚本对致命项（DTS / 机型 / MAC）严格失败，
+#         对非致命项（sysupgrade）降级为警告，避免误判成编译错误
+#       → 另有三处无线校验（6 / 8 / 12 步）防止「编译成功但没 WiFi」
+#
+# 全部校验都不改变编译行为，只在有问题时提前失败。
 # ══════════════════════════════════════════════════════════════
 
 on:
@@ -31,6 +35,9 @@ concurrency:
   cancel-in-progress: false
 
 env:
+  # 直接用【上游官方源】，不经过任何 fork
+  # 好处：源码零维护，换版本只改下面的 source_ref，不用管 fork 同步/冲突
+  # 代价：板级移植靠 prepare-source.py 在 CI 里打（见第 5 步）
   SOURCE_REPO: https://github.com/padavanonly/immortalwrt-mt798x-6.6.git
   TZ: Asia/Shanghai
 
@@ -41,6 +48,7 @@ jobs:
 
     steps:
       # ── 1. 取出本构建仓库（含 DTS / device.mk / 脚本 / config）──
+      #    源码用的是上游官方源，本仓库自带全部移植素材
       - name: Checkout build project
         uses: actions/checkout@v5
 
@@ -74,7 +82,7 @@ jobs:
             wget xmlto xxd zlib1g-dev zstd
           sudo timedatectl set-timezone "$TZ"
 
-      # ── 4. 克隆源码 ───────────────────────────────────────
+      # ── 4. 克隆【上游官方源】（原样，未做任何修改）──────────
       - name: Fetch source from fork
         run: |
           mkdir -p "$RUNNER_TEMP/wf3000a-build"
