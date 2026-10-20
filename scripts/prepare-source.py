@@ -387,35 +387,45 @@ def patch_platform_sh(source, log):
 
     lines = f.read_text(encoding="utf-8").split("\n")
 
-    # 所有出现过 ANCHOR 的函数都要补（通常是 do_upgrade 一个）
-    targets = []
-    for fname in ("platform_check_image", "platform_do_upgrade"):
+    # ⚠️ 必须【逐个函数重新定位】，不能先把位置全算出来再统一插。
+    # 原因：第一次插入会让后续行号整体下移，若沿用旧行号，
+    #       第二次插入会落在错误位置（实测会插到 esac 之后、case 之外 →
+    #       sh -n 直接报 Syntax error）。
+    # 这与 patch_02_network() 里"3a 插完必须重新定位"是同一个坑。
+    #
+    # 当前 padavanonly 6.6 的真实 platform.sh 里，ANCHOR 只出现在
+    # platform_do_upgrade() 一个函数中（platform_check_image() 走通用 `*)`），
+    # 所以实际只会命中 1 处。但上游若某天在 check_image 里也加了分支，
+    # 这段必须能正确工作 —— 故按"每次重新定位"实现。
+    fnames = ("platform_check_image", "platform_do_upgrade")
+    total = 0
+    for fname in fnames:
+        # 每次都基于【当前最新的 lines】重新定位（关键）
         rng = find_function(lines, fname)
-        if rng:
-            lo, hi = rng
-            starts = find_anchor_groups(lines, lo, hi, ANCHOR)
-            if starts:
-                targets.append((fname, starts))
+        if not rng:
+            continue
+        lo, hi = rng
+        starts = find_anchor_groups(lines, lo, hi, ANCHOR)
+        if not starts:
+            continue
+        ind = indent_of(lines[starts[0]])
+        if not ENABLE_SYSUPGRADE:
+            continue
+        block = [f"{ind}kst,wf3000a)"]
+        if SET_CI_PARTS:
+            block += [
+                f'{ind}\tCI_UBIPART="ubi"',
+                f'{ind}\tCI_KERNPART="kernel"',
+                f'{ind}\tCI_ROOTPART="rootfs"',
+            ]
+        block += [f'{ind}\tnand_do_upgrade "$1"', f"{ind}\t;;"]
+        total += insert_before(lines, starts, block)
 
-    if not targets:
+    if total == 0:
         # 非致命：只是没有 sysupgrade，U-Boot Web 刷机不受影响
         print("::warning::platform.sh 里未找到锚点，跳过 sysupgrade 补丁。"
               "仍可用 U-Boot Web 上传 factory.bin 刷机。")
         return 0
-
-    total = 0
-    for fname, starts in targets:
-        ind = indent_of(lines[starts[0]])
-        if ENABLE_SYSUPGRADE:
-            block = [f"{ind}kst,wf3000a)"]
-            if SET_CI_PARTS:
-                block += [
-                    f'{ind}\tCI_UBIPART="ubi"',
-                    f'{ind}\tCI_KERNPART="kernel"',
-                    f'{ind}\tCI_ROOTPART="rootfs"',
-                ]
-            block += [f'{ind}\tnand_do_upgrade "$1"', f"{ind}\t;;"]
-            total += insert_before(lines, starts, block)
 
     f.write_text("\n".join(lines), encoding="utf-8", newline="\n")
     log("动作4", f"platform.sh 已改：sysupgrade 分支 {total} 处")
