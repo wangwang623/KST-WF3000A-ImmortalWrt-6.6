@@ -184,6 +184,36 @@ FIRST_CARD_NAME_SYMBOLS = ('CONFIG_first_card=y', 'CONFIG_first_card_name="MT798
 # factory 分区标签：驱动 mt_mtd_read_nm_wifi() 先找 "Factory"，失败再找 "factory"
 FACTORY_LABEL = "factory"
 
+# ── mtwifi.sh：无线 MAC 从 factory 读取（动作 6）──────────────────
+# 背景：原版 detect_mtwifi() 生成 /etc/config/wireless 时【不设 macaddr】，
+#       驱动于是从 EEPROM 自行派生，实测结果：
+#         2.4G = ...:F9   5G = 4A:DA:35:50:70:F9（首字节被置 LAA 位 0x02）
+#       与 factory 里记录的 0x04=F7 / 0x0a=F8 都对不上。
+#
+# 做法：在生成配置时就按 factory 偏移写入 macaddr
+#         2.4G(idx=1) <- factory 偏移 4   (0x04，本机 ...:F7)
+#         5G          <- factory 偏移 10  (0x0a，本机 ...:F8)
+#       每台机器读自己的 flash -> 固件可公开分发，不会与他人撞 MAC。
+#
+# [注意] 闭源驱动仍会【忽略 5G 的 macaddr】——实测设 F8 / 4A:F9 后
+#        BSSID 恒为 LAA(2.4G)。这是驱动固有行为，改配置解决不了。
+#        本动作的实际收益是让 2.4G 默认即为 F7（刷完不用手动设一次）。
+#
+# 【为什么用整文件替换而不是查找插入】
+#    本脚本其它动作都靠正则/锚点在 CI 里做插入，上游改格式就失配——
+#    这正是查找替换最脆弱的地方。mtwifi.sh 只有 65 行、改动点 5 处，
+#    整文件替换反而更可靠。为防上游大改导致我们覆盖掉新功能，
+#    替换前先校验下面这批锚点，缺失即报错（不静默覆盖）。
+MTWIFI_SH_SRC = "package/mtk/applications/mtwifi-cfg/files/mtwifi.sh"
+MTWIFI_ANCHORS = (
+    'append DRIVERS "mtwifi"',
+    "detect_mtwifi()",
+    "uci -q batch",
+    "set wireless.default_${dev}.encryption=none",
+    "uci -q commit wireless",
+)
+MTWIFI_MAC_MARK = "mtwifi_factory_mac"   # 幂等标记
+
 
 # ══════════════════════════════════════════════════════════════
 # 二、通用工具：shell case 语句的定位与插入
@@ -520,6 +550,42 @@ def patch_eeprom_offset(source, log):
 # 四、打完补丁后复核
 # ══════════════════════════════════════════════════════════════
 
+def patch_mtwifi_mac(source, custom, log):
+    """动作 6：让无线 MAC 从 factory 分区读取（整文件替换 + 锚点校验）。
+
+    与前面几个动作【不同】：这里不做查找插入，而是整文件替换。
+    mtwifi.sh 仅 65 行、改动点 5 处，整文件替换比锚点插入更可靠；
+    为防止上游大改时我们静默覆盖掉新功能，替换前先校验锚点，
+    任一缺失即报错停止，由人工确认后再放行。
+    """
+    dst = source / MTWIFI_SH_SRC
+    if not dst.is_file():
+        raise FileNotFoundError(f"源码里找不到 {MTWIFI_SH_SRC}")
+
+    old = dst.read_text(encoding="utf-8")
+
+    # 幂等：已打过就跳过
+    if MTWIFI_MAC_MARK in old:
+        log("动作6", f"{MTWIFI_SH_SRC.split('/')[-1]} 已含 {MTWIFI_MAC_MARK}，跳过")
+        return 0
+
+    # 锚点校验：确认上游没有大改
+    missing = [a for a in MTWIFI_ANCHORS if a not in old]
+    if missing:
+        raise RuntimeError(
+            f"{MTWIFI_SH_SRC} 缺少预期锚点 {missing}。"
+            "上游可能已改版，custom/wf3000a/mtwifi.sh 需要重新对齐后再替换。"
+        )
+
+    src_file = custom / "mtwifi.sh"
+    if not src_file.is_file():
+        raise FileNotFoundError(f"缺少 {src_file}")
+
+    shutil.copyfile(src_file, dst)
+    log("动作6", f"mtwifi.sh 已替换 → {MTWIFI_SH_SRC}（无线 MAC 读 factory）")
+    return 1
+
+
 def verify(source):
     """逐条复核，缺哪项报哪项。致命项返回 False 让 workflow 失败。"""
     print("\n── 复核 ──────────────────────────────────────────")
@@ -597,6 +663,20 @@ def verify(source):
     for pkg in WIRELESS_DEVICE_PKGS:
         chk(pkg in dev_block, f"DEVICE_PACKAGES 含 {pkg}")
 
+    # mtwifi.sh：无线 MAC 是否从 factory 读取（动作 6）
+    mw = source / MTWIFI_SH_SRC
+    t_mw = mw.read_text(encoding="utf-8") if mw.is_file() else ""
+    if chk(mw.is_file(), "mtwifi.sh 存在", MTWIFI_SH_SRC.split("/")[-1]):
+        chk(MTWIFI_MAC_MARK in t_mw, "mtwifi.sh 已打 MAC 补丁", MTWIFI_MAC_MARK)
+        # 注意：mtwifi.sh 里是封装成函数后传偏移调用，
+        #       不是直接写 mtd_get_mac_binary factory 4
+        chk("mtwifi_factory_mac %d" % MAC_BASE_OFFSET in t_mw,
+            "2.4G 读 factory 偏移", f"0x{MAC_BASE_OFFSET:02x}")
+        chk("mtwifi_factory_mac %d" % (MAC_BASE_OFFSET + 6) in t_mw,
+            "5G 读 factory 偏移", f"0x{MAC_BASE_OFFSET + 6:02x}")
+        chk("lib/functions/system.sh" in t_mw,
+            "已 source system.sh（mtd_get_mac_binary 依赖）")
+
     # config.in 的 EEPROM 偏移 default 是否已改
     ci = source / MT_WIFI_CONFIG_IN
     t_ci = ci.read_text(encoding="utf-8") if ci.is_file() else ""
@@ -624,7 +704,7 @@ def verify(source):
 
     # config 里必须有 first_card_name="MT7981"，否则上面的 .dat 根本不会被安装
     cfg = source.parent  # 占位，实际从环境变量取不到就用默认路径
-    cfg_path = Path(__file__).resolve().parents[1] / "config" / "wf3000a.config"
+    cfg_path = Path(__file__).resolve().parents[1] / "defconfig" / "wf3000a.config"
     t_cfg = cfg_path.read_text(encoding="utf-8") if cfg_path.is_file() else ""
     for sym in FIRST_CARD_NAME_SYMBOLS:
         chk(sym in t_cfg, f'config 含 {sym}（决定 l1profile.dat 是否安装）')
@@ -678,6 +758,7 @@ def main():
     else:
         print("  （ENABLE_SYSUPGRADE=False，跳过 platform.sh 补丁）")
     patch_eeprom_offset(source, log)
+    patch_mtwifi_mac(source, custom, log)
 
     print(f"\n布局: {MTDPARTS_STR}")
     print(f"MAC : 基准=factory 偏移 {MAC_BASE_OFFSET}（2.4G） "
