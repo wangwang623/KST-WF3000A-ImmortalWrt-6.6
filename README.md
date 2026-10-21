@@ -29,6 +29,22 @@ ImmortalWrt 24.10 / Linux 6.6 固件。
 - 非致命项（sysupgrade）**降级为警告**，避免误判成编译错误
 - 打完补丁后逐条复核，缺哪项报哪项
 
+### 备选方案：源码改用 fork（不用打补丁）
+
+若把 `build.yml` 的 `SOURCE_REPO` 改成
+<https://github.com/wangwang623/immortalwrt-mt798x-6.6>，
+则**同样的 5 处移植改动已经直接写进源码**，CI 不再需要打补丁。
+
+| | 当前方案（上游源 + 打补丁） | 备选方案（fork 源码） |
+|---|---|---|
+| 查找替换风险 | 有（已加锚点校验） | **无** |
+| 上游同步 | 无冲突 | 可能冲突（5 文件约 30 行） |
+| 本地验证 | 只能靠 `simulate.py` 模拟 | **能直接 `sh -n`、看 diff** |
+
+⚠️ **两个方案不能叠加**：改用 fork 源码后必须**停用** `prepare-source.py`，
+否则 `patch_image_mk()` 会因机型定义已存在而报「重复定义」并失败。
+fork 仓库的 README 有完整的 5 处改动说明与自查命令。
+
 ---
 
 ## 硬件与布局
@@ -89,6 +105,7 @@ U-Boot 下载地址：
 | 源码（本工程使用） | <https://github.com/padavanonly/immortalwrt-mt798x-6.6> | **直接用上游官方源**，ImmortalWrt 24.10 + 内核 6.6，含 MTK 闭源无线驱动 |
 | 参考工程 A | <https://github.com/Anser-y/WF3000A-ImmortalWrt-6.6> | WF3000A 移植的早期版本（大分区布局 + 大量插件） |
 | 参考工程 B | 恩山无线论坛「小圆」的 WF3000A 固件 | 同为 padavanonly 6.6 源码，114M 布局，**有线/无线实测可用** |
+| 备选源码（fork） | <https://github.com/wangwang623/immortalwrt-mt798x-6.6> | 同一套 5 处移植改动**已直接写进源码**，可替代上游源（见上方「备选方案」） |
 | U-Boot | <https://github.com/VIKINGYFY/UBOOT-CI> | 多分区 U-Boot（含 114m 布局） |
 | 项目文档 | <https://cmi.hanwckf.top/p/immortalwrt-mt798x/> | ImmortalWrt-MT798X 项目介绍（hanwckf） |
 
@@ -129,7 +146,7 @@ U-Boot 下载地址：
 
 **无线不会自动带出来**——`filogic/target.mk` 的 `DEFAULT_PACKAGES` 里没有它，
 `filogic.mk` 的 134 处 `DEVICE_PACKAGES` 里也没有一处写 `kmod-mt_wifi`。
-必须在 `defconfig/wf3000a.config` 里显式写 `=y`。
+必须在 `config/wf3000a.config` 里显式写 `=y`。
 
 ### 闭源驱动的固有行为（不是 bug）
 
@@ -276,7 +293,7 @@ immortalwrt-...-mediatek-filogic-kst_wf3000a-squashfs-sysupgrade.bin
 
 ```
 .github/workflows/build.yml     云编译流程
-defconfig/wf3000a.config        构建配置（意图清单）
+config/wf3000a.config           构建配置（意图清单）
 custom/wf3000a/
   mt7981b-kst-wf3000a.dts       ①设备树（新增）
   device.mk                     ②机型定义（追加到 filogic.mk）
@@ -288,10 +305,13 @@ scripts/
   simulate.py                   本地模拟（不需要真的编译）
 ```
 
-> **别和源码的 `defconfig/` 搞混**：这里的 `defconfig/` 属于【本构建仓库】，
-> 放的是本工程自己的配置。源码仓库里也有一个 `defconfig/`（放
-> `mt7981-ax3000.config` 等官方基线），那是上游的东西，两者无关。
-> 本工程的配置文件沿用 `defconfig/` 这个目录名，是为了和源码的用法保持一致。
+> **别和源码的 `defconfig/` 搞混**：源码仓库里也有一个 `defconfig/`
+> （放 `mt7981-ax3000.config` 等官方基线），那是上游的东西，
+> 与本工程的 `config/wf3000a.config` 无关。
+>
+> 三处引用必须一致 —— `build.yml`（3 处）和 `scripts/prepare-source.py`
+> （第 707 行）都指向 `config/wf3000a.config`。若不一致，
+> 第 5 步会因读不到 config 而报「缺少 `CONFIG_first_card_name`」并失败。
 
 `custom/wf3000a/` 里的 `02_network` 和 `platform.sh` 是**参考文件**——
 云编译不读它们（`prepare-source.py` 直接在源码文件上做插入），
@@ -382,7 +402,7 @@ CONFIG_PACKAGE_luci=y        # 要
 
 ### ⚠️ 唯一的例外：无线驱动符号必须连 `is not set` 一起抄
 
-`defconfig/wf3000a.config` 里的 **MTK 驱动符号块**是**逐行照抄**
+`config/wf3000a.config` 里的 **MTK 驱动符号块**是**逐行照抄**
 源码自带的 `defconfig/mt7981-ax3000.config`，**包括 `# CONFIG_X is not set` 行**。
 
 原因：这批符号在 `mt_wifi/config.in` 里是 `default y`，
