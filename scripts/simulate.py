@@ -72,7 +72,7 @@ try:
 except Exception as e:
     chk(False, "build.yml YAML 正确", str(e))
 
-cfg_lines = (ROOT / "config/wf3000a.config").read_text().split("\n")
+cfg_lines = (ROOT / "defconfig/wf3000a.config").read_text().split("\n")
 syms = [l.split("=")[0] for l in cfg_lines
         if l.startswith("CONFIG_") and not l.startswith("#")]
 dup = {s for s in syms if syms.count(s) > 1}
@@ -183,6 +183,51 @@ if not SKIP_TREE:
     (src / ps.MT_WIFI_CONFIG_IN).parent.mkdir(parents=True, exist_ok=True)
     (src / ps.MT_WIFI_CONFIG_IN).write_text(FAKE_CONFIG_IN)
 
+    # 上游原版 mtwifi.sh 的最小等价物：只含动作6 依赖的锚点
+    # （真实上游 65 行，这里只要锚点齐全就能验证替换与校验逻辑）
+    UPSTREAM_MTWIFI_SH = "\n".join([
+        '#!/bin/sh',
+        '#',
+        '# Copyright (C) 2023, hanwckf <hanwckf@vip.qq.com>',
+        '#',
+        '',
+        'append DRIVERS "mtwifi"',
+        '',
+        'detect_mtwifi() {',
+        '\tlocal idx ifname',
+        '\tlocal band hwmode htmode htbsscoex ssid dbdc_main channel',
+        '\tif [ -d "/sys/module/mt_wifi" ]; then',
+        '\t\tdev_list="$(l1util list)"',
+        '\t\tfor dev in $dev_list; do',
+        '\t\t\tconfig_get type ${dev} type',
+        '\t\t\t[ "$type" = "mtwifi" ] || {',
+        '\t\t\t\tifname="$(l1util get ${dev} main_ifname)"',
+        '\t\t\t\tidx="$(l1util get ${dev} subidx)"',
+        '\t\t\t\tif [ $idx -eq 1 ]; then',
+        '\t\t\t\t\tband="2g"',
+        '\t\t\t\t\tssid="ImmortalWrt-2.4G"',
+        '\t\t\t\t\tchannel="auto"',
+        '\t\t\t\telse',
+        '\t\t\t\t\tband="5g"',
+        '\t\t\t\t\tssid="ImmortalWrt-5G"',
+        '\t\t\t\t\tchannel="36"',
+        '\t\t\t\t\tdbdc_main="0"',
+        '\t\t\t\tfi',
+        '\t\t\t\tuci -q batch <<-EOF',
+        '\t\t\t\t\tset wireless.default_${dev}=wifi-iface',
+        '\t\t\t\t\tset wireless.default_${dev}.ssid=${ssid}',
+        '\t\t\t\t\tset wireless.default_${dev}.encryption=none',
+        'EOF',
+        '\t\t\t\tuci -q commit wireless',
+        '\t\t\t}',
+        '\t\tdone',
+        '\tfi',
+        '}',
+        '',
+    ])
+    (src / ps.MTWIFI_SH_SRC).parent.mkdir(parents=True, exist_ok=True)
+    (src / ps.MTWIFI_SH_SRC).write_text(UPSTREAM_MTWIFI_SH)
+
     def strip_patched(name):
         lines = (ROOT / "custom/wf3000a" / name).read_text().split("\n")
         out, i = [], 0
@@ -232,6 +277,27 @@ if not SKIP_TREE:
     chk(not any(m in net for m in ("48:da:35:50:70:f5", "48:da:35:50:70:f6",
                                    "48:da:35:50:70:f7", "48:da:35:50:70:f8")),
         "未残留本机 MAC 硬编码")
+
+    # mtwifi.sh：无线 MAC 从 factory 读取（动作 6）
+    mtw = (src / ps.MTWIFI_SH_SRC).read_text()
+    chk(ps.MTWIFI_MAC_MARK in mtw, "mtwifi.sh 已替换（含 MAC 读取函数）")
+    chk("mtwifi_factory_mac 4" in mtw, "2.4G 读 factory 偏移 4 (0x04)")
+    chk("mtwifi_factory_mac 10" in mtw, "5G 读 factory 偏移 10 (0x0a)")
+    chk("lib/functions/system.sh" in mtw, "已 source system.sh")
+    chk("mtd_get_mac_binary factory" in mtw, "确有 factory 读取调用")
+    sh_mtw = run(["sh", "-n", str(src / ps.MTWIFI_SH_SRC)])
+    chk(sh_mtw.returncode == 0, "mtwifi.sh shell 语法正确", sh_mtw.stderr.strip()[:60])
+
+    # 上游改版时动作6 必须报错而非静默覆盖
+    _bad = Path(tempfile.mkdtemp(prefix="wf3000a-mtw-"))
+    (_bad / "package/mtk/applications/mtwifi-cfg/files").mkdir(parents=True)
+    (_bad / ps.MTWIFI_SH_SRC).write_text(UPSTREAM_MTWIFI_SH.replace(
+        "encryption=none", "encryption=psk2"))
+    try:
+        ps.patch_mtwifi_mac(_bad, ROOT / "custom/wf3000a", lambda a, b: None)
+        chk(False, "上游改版时应报错停止")
+    except RuntimeError as e:
+        chk("缺少预期锚点" in str(e), "上游改版时明确报错（不静默覆盖）")
 
     plat = (S / "filogic/base-files/lib/upgrade/platform.sh").read_text()
     chk("kst,wf3000a)" in plat, "sysupgrade 分支已写入")
