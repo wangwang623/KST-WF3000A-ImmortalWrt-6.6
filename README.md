@@ -129,7 +129,7 @@ U-Boot 下载地址：
 
 **无线不会自动带出来**——`filogic/target.mk` 的 `DEFAULT_PACKAGES` 里没有它，
 `filogic.mk` 的 134 处 `DEVICE_PACKAGES` 里也没有一处写 `kmod-mt_wifi`。
-必须在 `config/wf3000a.config` 里显式写 `=y`。
+必须在 `defconfig/wf3000a.config` 里显式写 `=y`。
 
 ### 闭源驱动的固有行为（不是 bug）
 
@@ -190,6 +190,57 @@ kst,wf3000a)
 > ```
 > 源码自带的 02_network 里就有 `macaddr_add "$lan_mac" -2` 的用法，实测可行。
 
+### 无线 MAC：由动作 6 改 `mtwifi.sh`
+
+有线 MAC 由 `02_network` 处理，无线则不同——它由
+`package/mtk/applications/mtwifi-cfg/files/mtwifi.sh` 的 `detect_mtwifi()`
+在生成 `/etc/config/wireless` 时决定。
+
+**原版问题**：`detect_mtwifi()` 根本不设 `macaddr`，驱动于是从 EEPROM
+自行派生。实机实测结果：
+
+```
+2.4G = ...:F9                    ← factory 里记录的是 F7
+5G   = 4A:DA:35:50:70:F9         ← 首字节被置 LAA 位（0x48 | 0x02）
+```
+
+**改法**（动作 6）：在生成配置时按 factory 偏移写入
+
+```sh
+if [ $idx -eq 1 ]; then          # 2.4G
+    macaddr="$(mtwifi_factory_mac 4)"      # factory 0x04 → F7
+else                             # 5G
+    macaddr="$(mtwifi_factory_mac 10)"     # factory 0x0a → F8
+fi
+```
+
+配套一个带容错的读取函数（读不到就不写，避免留空值）：
+
+```sh
+mtwifi_factory_mac() {
+	local off="$1" m=""
+	command -v mtd_get_mac_binary >/dev/null 2>&1 || return 1
+	m="$(mtd_get_mac_binary factory "$off" 2>/dev/null)"
+	case "$m" in
+		""|"00:00:00:00:00:00"|"ff:ff:ff:ff:ff:ff"|"FF:FF:FF:FF:FF:FF") return 1 ;;
+	esac
+	echo "$m"
+}
+```
+
+**为什么用整文件替换而不是查找插入**：本工程其它动作都靠正则/锚点做插入，
+上游改格式就失配——这正是查找替换最脆弱的地方。`mtwifi.sh` 只有 65 行、
+改动点 5 处，整文件替换反而更可靠。为防上游大改时被静默覆盖，
+替换前先校验 5 个锚点，任一缺失即**报错停止**（不静默覆盖）。
+
+> ⚠️ **闭源驱动仍会忽略 5G 的 macaddr**
+> 实测：LuCI 里设 `48:...:F8` 或 `4A:...:F9`，`b1.dat` 里也确实写成了 F8，
+> 但 BSSID 恒为 `LAA(2.4G)`。这是驱动固有行为，改配置解决不了。
+> 本动作的**实际收益是让 2.4G 默认即为 F7**（刷完不用手动设一次）。
+
+**生效时机**：只在生成 `/etc/config/wireless` 时执行
+（全新刷机，或删掉该文件后重启）。sysupgrade 保留配置时沿用旧配置。
+
 ---
 
 ## 使用步骤
@@ -225,16 +276,22 @@ immortalwrt-...-mediatek-filogic-kst_wf3000a-squashfs-sysupgrade.bin
 
 ```
 .github/workflows/build.yml     云编译流程
-config/wf3000a.config           构建配置（意图清单）
+defconfig/wf3000a.config        构建配置（意图清单）
 custom/wf3000a/
   mt7981b-kst-wf3000a.dts       ①设备树（新增）
   device.mk                     ②机型定义（追加到 filogic.mk）
   02_network                    ③参考：打完补丁后的样子
   platform.sh                   ④参考：打完补丁后的样子
+  mtwifi.sh                     ⑤改好的完整版（整文件替换，见下）
 scripts/
   prepare-source.py             打补丁 + 事后复核
   simulate.py                   本地模拟（不需要真的编译）
 ```
+
+> **别和源码的 `defconfig/` 搞混**：这里的 `defconfig/` 属于【本构建仓库】，
+> 放的是本工程自己的配置。源码仓库里也有一个 `defconfig/`（放
+> `mt7981-ax3000.config` 等官方基线），那是上游的东西，两者无关。
+> 本工程的配置文件沿用 `defconfig/` 这个目录名，是为了和源码的用法保持一致。
 
 `custom/wf3000a/` 里的 `02_network` 和 `platform.sh` 是**参考文件**——
 云编译不读它们（`prepare-source.py` 直接在源码文件上做插入），
@@ -301,7 +358,7 @@ dmesg | grep -iE "mt_wifi|warp|conninfra|eeprom"
 
 | 步骤 | 时机 | 检查 |
 |---|---|---|
-| 第 5 步 | 编译前 | 打补丁 + 事后复核（DTS / 机型 / MAC / sysupgrade / 无线包） |
+| 第 5 步 | 编译前 | 打补丁（5 个动作）+ 事后复核（DTS / 机型 / MAC / sysupgrade / mtwifi.sh / 无线包） |
 | 第 6 步 | defconfig 前 | 5 个无线包 + MT7981 固件 + l1profile.dat |
 | 第 8 步 | defconfig 前 | config 的 MTK 驱动符号与上游 defconfig **双向**比对 |
 | 第 9 步 | defconfig 后 | 无线包是否被静默丢弃 |
@@ -325,7 +382,7 @@ CONFIG_PACKAGE_luci=y        # 要
 
 ### ⚠️ 唯一的例外：无线驱动符号必须连 `is not set` 一起抄
 
-`config/wf3000a.config` 里的 **MTK 驱动符号块**是**逐行照抄**
+`defconfig/wf3000a.config` 里的 **MTK 驱动符号块**是**逐行照抄**
 源码自带的 `defconfig/mt7981-ax3000.config`，**包括 `# CONFIG_X is not set` 行**。
 
 原因：这批符号在 `mt_wifi/config.in` 里是 `default y`，
