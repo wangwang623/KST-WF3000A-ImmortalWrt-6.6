@@ -704,7 +704,7 @@ def verify(source):
 
     # config 里必须有 first_card_name="MT7981"，否则上面的 .dat 根本不会被安装
     cfg = source.parent  # 占位，实际从环境变量取不到就用默认路径
-    cfg_path = Path(__file__).resolve().parents[1] / "defconfig" / "wf3000a.config"
+    cfg_path = Path(__file__).resolve().parents[1] / "config" / "wf3000a.config"
     t_cfg = cfg_path.read_text(encoding="utf-8") if cfg_path.is_file() else ""
     for sym in FIRST_CARD_NAME_SYMBOLS:
         chk(sym in t_cfg, f'config 含 {sym}（决定 l1profile.dat 是否安装）')
