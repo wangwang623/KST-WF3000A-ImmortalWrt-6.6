@@ -64,15 +64,18 @@ IMAGE_SIZE = "IMAGE_SIZE := 115712k"        # = 116736k - 1MiB，留给 NMBM/UBI
 #   factory 0x0a = 48:DA:35:50:70:F8   ← 5G（由无线驱动直接读，这里不参与）
 #   机身标签     = 48:DA:35:50:70:F5
 #
-# 推算规则（基准 = 2.4G = F7）：
-#   LAN = 基准 - 1   →  F7 - 1 = F6
-#   WAN = 基准 - 2   →  F7 - 2 = F5
+# 推算规则（基准 = 2.4G - 2 = F5）：
+#   LAN = 基准       →  F5（= 机身标签地址）
+#   WAN = 基准 + 1   →  F6
+# 于是 LAN(F5) → WAN(F6) → 2.4G(F7) → 5G(F8) 升序连续。
 #
 # ⚠️ 若你的机器布局不同，只改下面三个数字即可，不用动任何代码逻辑。
 # ══════════════════════════════════════════════════════════════
-MAC_BASE_OFFSET = 4     # factory 分区内偏移（十进制 4 = 十六进制 0x04）：2.4G MAC
-MAC_LAN_DELTA = -1      # LAN  = 基准 - 1
-MAC_WAN_DELTA = -2      # WAN  = 基准 - 2
+MAC_BASE_OFFSET = 4      # factory 分区内偏移（十进制 4  = 十六进制 0x04）：2.4G 无线 MAC
+MAC_WLAN5G_OFFSET = 10   # factory 分区内偏移（十进制 10 = 十六进制 0x0a）：5G   无线 MAC
+MAC_BASE_SUB   = 2      # 基准 = 2.4G - 2（使 LAN 恰好等于机身标签地址）
+MAC_LAN_DELTA = 0       # LAN  = 基准     （= 机身标签地址）
+MAC_WAN_DELTA = 1       # WAN  = 基准 + 1
 
 # ── 锚点机型：补丁插入位置的参照物 ──────────────────────────
 # 选 360T7 是因为它与 WF3000A 同为 MT7531 交换机 + 4 个千兆口，
@@ -370,32 +373,70 @@ def patch_02_network(source, log):
             "上游文件可能已改版，请人工核对。"
         )
     ind = indent_of(lines[starts[0]])
-    # 续行并入：只加一行 kst,wf3000a|\
+    # 以续行形式并入该组（带反斜杠，因为后面还跟着该组的其它成员）
     n_iface = insert_before(lines, starts, [f"{ind}kst,wf3000a|\\"])
 
     # ── 3b MAC 分支 ──
-    # 注意：3a 插入后行号变了，必须重新定位函数
-    lines = "\n".join(lines).split("\n")
-    rng = find_function(lines, "mediatek_setup_macs")
-    if not rng:
+    # ★ 必须重新定位到 mediatek_setup_macs()：
+    #   3a 已在接口函数里插入过内容，行号已变，且两个函数同名锚点不同，
+    #   沿用上面的 starts 会把 MAC 分支插进接口函数里（静默错位）。
+    rng_m = find_function(lines, "mediatek_setup_macs")
+    if not rng_m:
         raise RuntimeError("02_network 里找不到 mediatek_setup_macs()")
-    lo, hi = rng
-    starts = find_anchor_groups(lines, lo, hi, ANCHOR)
-    if not starts:
+    lo_m, hi_m = rng_m
+    starts_m = find_anchor_groups(lines, lo_m, hi_m, ANCHOR)
+    if not starts_m:
         raise RuntimeError(
-            f"mediatek_setup_macs() 里找不到锚点 {ANCHOR}，无法定位 MAC 分支位置。"
+            f"mediatek_setup_macs() 里找不到锚点 {ANCHOR}，无法定位 MAC 分支。"
+            "上游文件可能已改版，请人工核对。"
         )
-    ind = indent_of(lines[starts[0]])
-    # 独立分支：插在 360T7 组【之前】
+    ind = indent_of(lines[starts_m[0]])
+    # 独立分支：插在 360T7 分支【之前】
+    # MAC 规则：factory 0x04 = 2.4G 无线 MAC（F7），0x0a = 5G（F8）
+    #   基准 = 2.4G - 2（F5）→ LAN，同时作为机身标签地址
+    #   WAN  = 基准 + 1（F6）
+    # 同时抢先把 F7/F8 写进 .dat，阻断尾部 base+3/+4 算出 F9/FA。
     block = [
         f"{ind}kst,wf3000a)",
-        f'{ind}\tbase_mac=$(mtd_get_mac_binary factory {MAC_BASE_OFFSET})',
-        f'{ind}\tlan_mac=$(macaddr_add "$base_mac" {MAC_LAN_DELTA})',
-        f'{ind}\twan_mac=$(macaddr_add "$base_mac" {MAC_WAN_DELTA})',
-        f"{ind}\tlabel_mac=$lan_mac",
-        f"{ind}\t;;",
+        f'{ind}\t# ── factory 分区里存有两个无线 MAC ──',
+        f'{ind}\t#   偏移 0x04 = 2.4G 无线 MAC（本机 ...:F7）',
+        f'{ind}\t#   偏移 0x0a = 5G   无线 MAC（本机 ...:F8）',
+        f'{ind}\t# 有线 MAC 以 2.4G MAC 为参照推算，编号与无线连续：',
+        f'{ind}\t#   基准 = 2.4G - 2 = ...:F5  → LAN（= 机身标签地址）',
+        f'{ind}\t#   WAN  = 基准 + 1 = ...:F6',
+        f'{ind}\t# 即 LAN(F5) → WAN(F6) → 2.4G(F7) → 5G(F8) 升序排列。',
+        f'{ind}\tlocal wlan_2g_mac=""',
+        f'{ind}\tlocal wlan_5g_mac=""',
+        f'{ind}\twlan_2g_mac=$(mtd_get_mac_binary factory {MAC_BASE_OFFSET})',
+        f'{ind}\twlan_5g_mac=$(mtd_get_mac_binary factory {MAC_WLAN5G_OFFSET})',
+        f'',
+        f'{ind}\t# 校验：排除空值 / 全 0 / 全 F，读不到就整体回退，绝不写脏值',
+        f'{ind}\tcase "$wlan_2g_mac" in',
+        f'{ind}\t\t""|"00:00:00:00:00:00"|"ff:ff:ff:ff:ff:ff"|"FF:FF:FF:FF:FF:FF")',
+        f'{ind}\t\t\twlan_2g_mac=""; wlan_5g_mac="" ;;',
+        f'{ind}\tesac',
+        f'',
+        f'{ind}\tif [ -n "$wlan_2g_mac" ]; then',
+        f'{ind}\t\tbase_mac=$(macaddr_add "$wlan_2g_mac" -{MAC_BASE_SUB})',
+        f'{ind}\t\tlan_mac=$base_mac',
+        f'{ind}\t\tlabel_mac=$lan_mac',
+        f'{ind}\t\twan_mac=$(macaddr_add "$base_mac" {MAC_WAN_DELTA})',
+        f'{ind}\tfi',
+        f'',
+        f'{ind}\t# ── 抢先把无线 MAC 写进 .dat，阻断尾部的 base+3/+4 ──',
+        f'{ind}\t# 尾部逻辑是 base_mac+3 / +4，沿用会算出 F9 / FA（2.4G 显示 F9 的根因）。',
+        f'{ind}\t# 这里先写入正确值，尾部的 `! grep -q "MacAddress="` 守卫就会跳过。',
+        f'{ind}\tif [ -n "$wlan_2g_mac" ] && [ -f "$b0dat" ] \\',
+        f'{ind}\t   && ! grep -q "MacAddress=" "$b0dat"; then',
+        f'{ind}\t\techo "MacAddress=$wlan_2g_mac" >> "$b0dat"',
+        f'{ind}\tfi',
+        f'{ind}\tif [ -n "$wlan_5g_mac" ] && [ -f "$b1dat" ] \\',
+        f'{ind}\t   && ! grep -q "MacAddress=" "$b1dat"; then',
+        f'{ind}\t\techo "MacAddress=$wlan_5g_mac" >> "$b1dat"',
+        f'{ind}\tfi',
+        f"{ind}	;;",
     ]
-    n_mac = insert_before(lines, starts, block)
+    n_mac = insert_before(lines, starts_m, block)
 
     f.write_text("\n".join(lines), encoding="utf-8", newline="\n")
     log("动作3", f"02_network 已改：接口分组 {n_iface} 处 + MAC 分支 {n_mac} 处")
@@ -623,8 +664,10 @@ def verify(source):
     # 不再校验硬编码值（那样会把本机 MAC 写死），改为校验推算逻辑三要素
     chk("mtd_get_mac_binary factory %d" % MAC_BASE_OFFSET in t,
         "MAC 基准读取已写入", f"factory 偏移 {MAC_BASE_OFFSET}")
-    chk(f'macaddr_add "$base_mac" {MAC_LAN_DELTA}' in t,
-        "LAN 推算已写入", f"基准 {MAC_LAN_DELTA:+d}")
+    chk(f'macaddr_add "$wlan_2g_mac" -{MAC_BASE_SUB}' in t,
+        "基准推算已写入", f"2.4G - {MAC_BASE_SUB}")
+    chk("lan_mac=$base_mac" in t and "label_mac=$lan_mac" in t,
+        "LAN/label = 基准 已写入", "标签地址 = LAN")
     chk(f'macaddr_add "$base_mac" {MAC_WAN_DELTA}' in t,
         "WAN 推算已写入", f"基准 {MAC_WAN_DELTA:+d}")
 
@@ -704,7 +747,7 @@ def verify(source):
 
     # config 里必须有 first_card_name="MT7981"，否则上面的 .dat 根本不会被安装
     cfg = source.parent  # 占位，实际从环境变量取不到就用默认路径
-    cfg_path = Path(__file__).resolve().parents[1] / "config" / "wf3000a.config"
+    cfg_path = Path(__file__).resolve().parents[1] / "defconfig" / "wf3000a.config"
     t_cfg = cfg_path.read_text(encoding="utf-8") if cfg_path.is_file() else ""
     for sym in FIRST_CARD_NAME_SYMBOLS:
         chk(sym in t_cfg, f'config 含 {sym}（决定 l1profile.dat 是否安装）')
@@ -761,8 +804,8 @@ def main():
     patch_mtwifi_mac(source, custom, log)
 
     print(f"\n布局: {MTDPARTS_STR}")
-    print(f"MAC : 基准=factory 偏移 {MAC_BASE_OFFSET}（2.4G） "
-          f"LAN=基准{MAC_LAN_DELTA:+d}  WAN=基准{MAC_WAN_DELTA:+d}")
+    print(f"MAC : 基准=factory 偏移 {MAC_BASE_OFFSET}（2.4G）-{MAC_BASE_SUB} "
+          f"LAN=基准  WAN=基准{MAC_WAN_DELTA:+d}")
     print("      每台机器读自己的 flash，不会与他人撞 MAC")
 
     if not verify(source):
