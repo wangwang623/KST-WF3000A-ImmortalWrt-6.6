@@ -31,6 +31,7 @@ immortalwrt-mt798x-6.6 源码仓库【保持原样，不做任何手动修改】
 """
 
 from pathlib import Path
+import os
 import re
 import shutil
 import sys
@@ -587,6 +588,40 @@ def patch_eeprom_offset(source, log):
     return changed
 
 
+def resolve_config_path():
+    """定位 wf3000a.config —— 自动探测，不再硬编码单一目录。
+
+    背景：本仓库历史上同时出现过 config/ 与 defconfig/ 两种放法，
+    硬编码其中一个都会在另一种布局下读到空文件，导致
+    「config 含 CONFIG_first_card=y」误报 FAIL 并中断编译。
+
+    探测顺序：
+      1) 环境变量 CONFIG_FILE（workflow 可显式指定）
+      2) <仓库根>/config/wf3000a.config      <- 当前实际布局
+      3) <仓库根>/defconfig/wf3000a.config   <- padavanonly 惯例
+      4) <仓库根>/wf3000a.config
+    全都不存在时返回第一个候选，由上层按「未找到」处理。
+    """
+    root = Path(__file__).resolve().parents[1]
+    cands = []
+    env = os.environ.get("CONFIG_FILE", "").strip()
+    if env:
+        cands.append(Path(env))
+    cands += [
+        root / "config" / "wf3000a.config",
+        root / "defconfig" / "wf3000a.config",
+        root / "wf3000a.config",
+    ]
+    for c in cands:
+        if c.is_file():
+            try:
+                rel = str(c.relative_to(root))
+            except ValueError:
+                rel = str(c)
+            return c, rel
+    return cands[0], ""
+
+
 # ══════════════════════════════════════════════════════════════
 # 四、打完补丁后复核
 # ══════════════════════════════════════════════════════════════
@@ -746,9 +781,9 @@ def verify(source):
         f"l1profile.dat 含 {L1PROFILE_KEY}")
 
     # config 里必须有 first_card_name="MT7981"，否则上面的 .dat 根本不会被安装
-    cfg = source.parent  # 占位，实际从环境变量取不到就用默认路径
-    cfg_path = Path(__file__).resolve().parents[1] / "defconfig" / "wf3000a.config"
+    cfg_path, cfg_used = resolve_config_path()
     t_cfg = cfg_path.read_text(encoding="utf-8") if cfg_path.is_file() else ""
+    print(f"  [info] 配置文件 = {cfg_used or '（未找到）'}")
     for sym in FIRST_CARD_NAME_SYMBOLS:
         chk(sym in t_cfg, f'config 含 {sym}（决定 l1profile.dat 是否安装）')
 
